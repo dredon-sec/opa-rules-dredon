@@ -1,0 +1,2 @@
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
+USER 10001

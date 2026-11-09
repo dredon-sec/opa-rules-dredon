@@ -1,0 +1,6 @@
+name: t
+on: push
+permissions: {}
+jobs:
+  a:
+    uses: other-org/shared/.github/workflows/build.yml@main

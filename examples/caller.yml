@@ -1,0 +1,20 @@
+# Example caller: copy to .github/workflows/governance.yml in a repository that
+# should be checked. The repository must also be added to the runner group's
+# repository access list.
+name: governance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  governance:
+    uses: ORG/GOVERNANCE-REPO/.github/workflows/governance-gate.yml@main
+    with:
+      enforce: true
+      terraform_dirs: |
+        infra

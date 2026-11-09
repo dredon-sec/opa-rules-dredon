@@ -1,0 +1,7 @@
+name: governance
+on: [pull_request]
+jobs:
+  gate:
+    permissions:
+      contents: read
+    uses: ORG/GOVERNANCE-REPO/.github/workflows/governance-gate.yml@main

@@ -1,0 +1,136 @@
+# Governance gate - reusable workflow (also runnable by hand in this repo).
+# Evaluates Dockerfiles, workflow files and Terraform plans against the policies
+# baked into the gate image. This workflow EVALUATES; enforcement and exceptions
+# belong to the separate security gate.
+name: governance-gate
+
+on:
+  workflow_call:
+    inputs:
+      enforce:
+        description: Fail the job when the gate blocks (errors always fail)
+        type: boolean
+        default: true
+      terraform_dirs:
+        description: Terraform root folders to plan, one per line
+        type: string
+        default: ""
+      ignore_paths:
+        description: Paths to skip, one per line
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: Fail the job when the gate blocks (errors always fail)
+        type: boolean
+        default: true
+      terraform_dirs:
+        description: Terraform root folders to plan, one per line
+        type: string
+        default: ""
+      ignore_paths:
+        description: Paths to skip, one per line
+        type: string
+        default: tests
+
+permissions:
+  contents: read
+
+env:
+  # Gate image ID on the runner host. This ID is the policy version: a policy
+  # change means rebuilding the image and committing the new ID here.
+  GATE_IMAGE: GATE-IMAGE-ID
+  # Plain copy of every decision on the runner host (internal demo; not tamper-evident).
+  LOCAL_COPY_DIR: /data/evidence/runs
+  # Upload decision.json to GitHub as an artifact. Off until the upload policy is confirmed.
+  UPLOAD_DECISION: "false"
+
+jobs:
+  gate:
+    runs-on: [self-hosted, governance-gate]
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository being evaluated
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the gate
+        id: gate
+        # Inputs and context values reach the script as environment variables,
+        # never pasted into it, so they cannot inject shell commands.
+        env:
+          ENFORCE: ${{ inputs.enforce }}
+          TF_DIRS: ${{ inputs.terraform_dirs }}
+          IGNORE_PATHS: ${{ inputs.ignore_paths }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # no "set -e": the gate's exit code is a result to record, not a step failure
+          set +e -uo pipefail
+          trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+          args=(--source /src)
+          for kv in "repo=$REPO" "commit=$COMMIT" "ref=$REF" "actor=$ACTOR" "event=$EVENT" \
+                    "run_id=$RUN_ID" "run_attempt=$RUN_ATTEMPT" "gate_image=$GATE_IMAGE" "enforce=$ENFORCE"; do
+            args+=(--metadata "$kv")
+          done
+          while IFS= read -r line; do
+            line=$(trim "$line"); [ -n "$line" ] && args+=(--terraform-dir "$line")
+          done <<< "$TF_DIRS"
+          while IFS= read -r line; do
+            line=$(trim "$line"); [ -n "$line" ] && args+=(--ignore "$line")
+          done <<< "$IGNORE_PATHS"
+          podman run --rm --pull=never -v "$GITHUB_WORKSPACE:/src:ro,z" "$GATE_IMAGE" \
+            gate-run "${args[@]}" > "$RUNNER_TEMP/decision.json"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Keep a copy on the runner host
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          dir="$LOCAL_COPY_DIR/$REPO"
+          mkdir -p "$dir"
+          cp -n "$RUNNER_TEMP/decision.json" "$dir/$RUN_ID-$RUN_ATTEMPT.json"
+          echo "decision saved on the runner host: $dir/$RUN_ID-$RUN_ATTEMPT.json"
+
+      - name: Write the run summary
+        run: |
+          set -uo pipefail
+          if [ -s "$RUNNER_TEMP/decision.json" ]; then
+            podman run --rm -i --pull=never --network=none "$GATE_IMAGE" gate-run summary \
+              < "$RUNNER_TEMP/decision.json" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Governance gate: ERROR (no decision produced)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload decision.json
+        if: env.UPLOAD_DECISION == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: governance-decision-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/decision.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Apply the decision
+        env:
+          RC: ${{ steps.gate.outputs.rc }}
+          ENFORCE: ${{ inputs.enforce }}
+        run: |
+          case "$RC" in
+            0) echo "Governance gate: allow" ;;
+            1) if [ "$ENFORCE" = "true" ]; then
+                 echo "::error::Governance gate blocked this change (see the run summary)"; exit 1
+               fi
+               echo "::warning::Governance gate found problems; enforce is off, so the job passes" ;;
+            *) echo "::error::Governance gate error (exit $RC): the change was not evaluated"; exit 1 ;;
+          esac

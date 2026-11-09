@@ -1,0 +1,11 @@
+name: t
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    services:
+      cache:
+        image: redis:7
+    steps:
+      - uses: docker://alpine:3.20

@@ -1,0 +1,13 @@
+name: t
+on: push
+jobs:
+  ok:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+  missing:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo missing

@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# gate-run - governance gate entry point, baked into the gate image.
+#
+#   gate-run --source DIR [--terraform-dir REL]... [--ignore REL]...
+#            [--metadata key=value]... [--policy DIR]
+#   gate-run summary [--policy DIR]   # decision.json on stdin -> markdown on stdout
+#
+# Writes decision.json to stdout and one summary line to stderr.
+# Exit codes: 0 allow, 1 block, 2 error.
+# CI-agnostic by design: it never reads CI environment variables; everything
+# about the run arrives as explicit --metadata flags.
+set -uo pipefail
+shopt -s globstar nullglob dotglob
+
+policy=/opt/gate/policy
+source_dir=""
+tf_dirs=()
+ignores=()
+meta_keys=()
+meta_vals=()
+
+say() { printf '%s\n' "$*" >&2; }
+
+# Minimal JSON string escaping: backslash, quote, newline, tab and CR are
+# escaped; any other control character is dropped.
+json_str() {
+  local s
+  s=$(printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037') || return 1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+# Last-resort output when the gate cannot reach a decision.
+fail() {
+  local msg
+  msg=$(json_str "$1") || msg='"gate-run failed"'
+  printf '{"schema":"governance.gate.decision/v1","decision":"error","errors":[{"kind":"gate","target":"gate-run","detail":%s}]}\n' "$msg"
+  say "gate decision=error ($1)"
+  exit 2
+}
+
+mode=run
+if [[ ${1:-} == summary ]]; then mode=summary; shift; fi
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --source)        source_dir=${2:-}; shift 2 ;;
+    --terraform-dir) tf_dirs+=("${2:-}"); shift 2 ;;
+    --ignore)        ignores+=("${2:-}"); shift 2 ;;
+    --policy)        policy=${2:-}; shift 2 ;;
+    --metadata)
+      kv=${2:-}
+      [[ $kv =~ ^([a-z_]+)=(.*)$ ]] || fail "bad --metadata value (use key=value, key in a-z and _)"
+      meta_keys+=("${BASH_REMATCH[1]}"); meta_vals+=("${BASH_REMATCH[2]}"); shift 2 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+if [[ $mode == summary ]]; then
+  exec opa eval --stdin-input --format raw --data "$policy/decision" 'data.decision.summary.markdown'
+fi
+
+[[ -n $source_dir && -d $source_dir ]] || fail "--source must be an existing folder"
+source_dir=${source_dir%/}
+for d in "$policy/dockerfile" "$policy/workflows" "$policy/terraform" "$policy/decision"; do
+  [[ -d $d ]] || fail "policy folder missing: $d"
+done
+
+work=/tmp/gate-run.$$
+mkdir -p "$work/results" || fail "cannot create work folder"
+trap 'rm -rf "$work"' EXIT
+
+ignored() {
+  local rel=$1 prefix
+  [[ $rel == .git/* ]] && return 0
+  for prefix in "${ignores[@]}"; do
+    prefix=${prefix%/}
+    [[ -z $prefix ]] && continue
+    [[ $rel == "$prefix" || $rel == "$prefix"/* ]] && return 0
+  done
+  return 1
+}
+
+# ---------- find files ----------
+
+dockerfiles=()
+for f in "$source_dir"/**/Dockerfile "$source_dir"/**/Containerfile \
+         "$source_dir"/**/*.Dockerfile "$source_dir"/**/*.Containerfile; do
+  [[ -f $f ]] || continue
+  ignored "${f#"$source_dir"/}" || dockerfiles+=("$f")
+done
+
+workflows=()
+for f in "$source_dir"/.github/workflows/*.yml "$source_dir"/.github/workflows/*.yaml; do
+  [[ -f $f ]] || continue
+  ignored "${f#"$source_dir"/}" || workflows+=("$f")
+done
+
+# ---------- run checks ----------
+
+checks=()   # JSON fragments
+errors=()   # JSON fragments
+n=0
+
+add_error() {  # kind target detail
+  local t d
+  t=$(json_str "$2") || t='"?"'
+  d=$(json_str "$3") || d='"(detail not printable)"'
+  errors+=("{\"kind\":\"$1\",\"target\":$t,\"detail\":$d}")
+}
+
+run_conftest() {  # kind parser files...
+  local kind=$1 parser=$2; shift 2
+  local out="$work/results/$((n += 1)).json"
+  if conftest test --no-fail --no-color -o json --parser "$parser" \
+       --namespace "$kind" -p "$policy/$kind" "$@" > "$out" 2> "$out.err"; then
+    checks+=("{\"kind\":\"$kind\",\"target\":\"\",\"conftest\":$(cat "$out")}")
+  else
+    add_error "$kind" "conftest" "$(head -c 2000 "$out.err")"
+  fi
+}
+
+[[ ${#dockerfiles[@]} -gt 0 ]] && run_conftest dockerfile dockerfile "${dockerfiles[@]}"
+[[ ${#workflows[@]} -gt 0 ]] && run_conftest workflows yaml "${workflows[@]}"
+
+tf_count=0
+for rel in "${tf_dirs[@]}"; do
+  rel=${rel%/}
+  [[ -z $rel ]] && continue
+  tf_count=$((tf_count + 1))
+  if [[ $rel == /* || $rel == *..* || ! -d $source_dir/$rel ]]; then
+    add_error terraform "$rel" "not a folder inside the repository"; continue
+  fi
+  wd="$work/tf/$tf_count"
+  mkdir -p "$wd" && cp -r "$source_dir/$rel"/. "$wd"/
+  rm -rf "$wd/.terraform"
+  out="$work/results/tf-$tf_count.json"
+  if ! (cd "$wd" &&
+        terraform init -input=false -no-color > "$wd.log" 2>&1 &&
+        terraform plan -input=false -no-color -lock=false -out="$wd.plan" >> "$wd.log" 2>&1); then
+    add_error terraform "$rel" "terraform init/plan failed: $(tail -c 2000 "$wd.log")"
+    continue
+  fi
+  # The plan JSON goes straight from terraform to conftest and is never written to disk.
+  if (cd "$wd" && terraform show -json "$wd.plan") |
+       conftest test --no-fail --no-color -o json --parser json --namespace terraform \
+         -p "$policy/terraform" - > "$out" 2> "$out.err"; then
+    t=$(json_str "$rel")
+    checks+=("{\"kind\":\"terraform\",\"target\":$t,\"conftest\":$(cat "$out")}")
+  else
+    add_error terraform "$rel" "conftest failed: $(head -c 2000 "$out.err")"
+  fi
+  rm -rf "$wd" "$wd.plan"
+done
+
+# ---------- build the decision ----------
+
+join() { local IFS=,; printf '%s' "$*"; }
+
+meta=()
+for i in "${!meta_keys[@]}"; do
+  v=$(json_str "${meta_vals[$i]}") || fail "metadata ${meta_keys[$i]} has control characters"
+  meta+=("\"${meta_keys[$i]}\":$v")
+done
+
+src=$(json_str "$source_dir/") || fail "source path not printable"
+input="$work/input.json"
+printf '{"source":%s,"metadata":{%s},"scanned":{"dockerfile":%d,"workflows":%d,"terraform":%d},"checks":[%s],"errors":[%s]}\n' \
+  "$src" "$(join "${meta[@]}")" "${#dockerfiles[@]}" "${#workflows[@]}" "$tf_count" \
+  "$(join "${checks[@]}")" "$(join "${errors[@]}")" > "$input"
+
+ev() { opa eval --format raw --data "$policy/decision" --input "$input" "$1"; }
+
+decision=$(ev 'json.marshal_with_options(data.decision.result, {"pretty": true, "indent": "  "})') ||
+  fail "could not build the decision"
+code=$(ev 'data.decision.exit_code') || fail "could not read the exit code"
+line=$(ev 'data.decision.summary_line') || line="gate decision=? (summary unavailable)"
+
+printf '%s\n' "$decision"
+say "$line"
+exit "$code"
