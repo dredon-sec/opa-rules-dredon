@@ -38,6 +38,12 @@ printf 'resource "github_repository" "x" {\n  nonsense = 1\n}\n' > "$tmp/broken/
 
 mkrepo empty
 
+# a folder the container user cannot open must give "error", never a silent pass
+mkrepo locked
+mkdir -p "$tmp/locked/private"
+cp $t/dockerfile/fail-root/Dockerfile "$tmp/locked/private/Dockerfile"
+chmod 700 "$tmp/locked/private"
+
 # ---------- cases: name | repo | expected exit | expected rule IDs | gate-run args ----------
 cases=(
   "clean            |clean |0|                            |--terraform-dir infra"
@@ -46,6 +52,7 @@ cases=(
   "terraform-error  |broken|2|                            |--terraform-dir infra"
   "path-escape      |empty |2|                            |--terraform-dir ../etc"
   "empty            |empty |0|                            |"
+  "unreadable       |locked|2|                            |"
 )
 
 rc=0

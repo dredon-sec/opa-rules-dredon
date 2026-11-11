@@ -65,6 +65,7 @@ if [[ $mode == summary ]]; then
 fi
 
 [[ -n $source_dir && -d $source_dir ]] || fail "--source must be an existing folder"
+[[ -r $source_dir && -x $source_dir ]] || fail "cannot read the source folder (check file permissions)"
 source_dir=${source_dir%/}
 for d in "$policy/dockerfile" "$policy/workflows" "$policy/terraform" "$policy/decision"; do
   [[ -d $d ]] || fail "policy folder missing: $d"
@@ -85,19 +86,31 @@ ignored() {
   return 1
 }
 
+# ---------- make sure the whole source can be read ----------
+# Shell globs skip folders they cannot open without saying so. Without this
+# sweep, an unreadable checkout would look like an empty repository and pass.
+unreadable=()
+for d in "$source_dir"/**/; do
+  rel=${d#"$source_dir"/}; rel=${rel%/}
+  ignored "$rel" && continue
+  [[ -r $d && -x $d ]] || unreadable+=("$rel/")
+done
+
 # ---------- find files ----------
 
 dockerfiles=()
 for f in "$source_dir"/**/Dockerfile "$source_dir"/**/Containerfile \
          "$source_dir"/**/*.Dockerfile "$source_dir"/**/*.Containerfile; do
   [[ -f $f ]] || continue
-  ignored "${f#"$source_dir"/}" || dockerfiles+=("$f")
+  ignored "${f#"$source_dir"/}" && continue
+  if [[ -r $f ]]; then dockerfiles+=("$f"); else unreadable+=("${f#"$source_dir"/}"); fi
 done
 
 workflows=()
 for f in "$source_dir"/.github/workflows/*.yml "$source_dir"/.github/workflows/*.yaml; do
   [[ -f $f ]] || continue
-  ignored "${f#"$source_dir"/}" || workflows+=("$f")
+  ignored "${f#"$source_dir"/}" && continue
+  if [[ -r $f ]]; then workflows+=("$f"); else unreadable+=("${f#"$source_dir"/}"); fi
 done
 
 # ---------- run checks ----------
@@ -123,6 +136,10 @@ run_conftest() {  # kind parser files...
     add_error "$kind" "conftest" "$(head -c 2000 "$out.err")"
   fi
 }
+
+if [[ ${#unreadable[@]} -gt 0 ]]; then
+  add_error source "${#unreadable[@]} paths" "cannot read: ${unreadable[*]:0:20}"
+fi
 
 [[ ${#dockerfiles[@]} -gt 0 ]] && run_conftest dockerfile dockerfile "${dockerfiles[@]}"
 [[ ${#workflows[@]} -gt 0 ]] && run_conftest workflows yaml "${workflows[@]}"
