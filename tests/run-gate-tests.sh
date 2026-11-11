@@ -44,10 +44,11 @@ mkdir -p "$tmp/locked/private"
 cp $t/dockerfile/fail-root/Dockerfile "$tmp/locked/private/Dockerfile"
 chmod 700 "$tmp/locked/private"
 
-# ---------- cases: name | repo | expected exit | expected rule IDs | gate-run args ----------
+# ---------- cases: name | repo | expected exit | expected rule IDs | gate-run args | must contain ----------
+# "must contain" is matched against the decision with all spaces and newlines removed.
 cases=(
-  "clean            |clean |0|                            |--terraform-dir infra"
-  "mixed            |mixed |1|DF-004 TF-003 TF-004 WF-001 |--terraform-dir infra --ignore tests"
+  "clean            |clean |0|                            |--terraform-dir infra|\"terraform_dirs\":[\"infra\"]"
+  "mixed            |mixed |1|DF-004 TF-003 TF-004 WF-001 |--terraform-dir infra --ignore tests|\"ignore_paths\":[\"tests\"]"
   "mixed-no-ignore  |mixed |1|DF-001 DF-004 TF-003 TF-004 WF-001|--terraform-dir infra"
   "terraform-error  |broken|2|                            |--terraform-dir infra"
   "path-escape      |empty |2|                            |--terraform-dir ../etc"
@@ -57,7 +58,7 @@ cases=(
 
 rc=0
 for c in "${cases[@]}"; do
-  IFS='|' read -r name repo want_rc want_ids args <<<"$c"
+  IFS='|' read -r name repo want_rc want_ids args must <<<"$c"
   name=$(xargs <<<"$name"); repo=$(xargs <<<"$repo"); want_ids=$(xargs <<<"$want_ids")
   # shellcheck disable=SC2086  # args are word-split on purpose
   out=$(podman run --rm --network=none "${pol_mount[@]}" -v "$tmp/$repo:/src:ro,z" "$img" \
@@ -65,10 +66,12 @@ for c in "${cases[@]}"; do
   got_rc=$?
   got_ids=$(grep -o '"rule_id": "[A-Z]*-[0-9]*"' <<<"$out" | grep -o '[A-Z]*-[0-9]*' | sort -u | xargs)
   decision=$(grep -o '"decision": *"[a-z]*"' <<<"$out" | head -1 | grep -o '[a-z]*"$' | tr -d '"')
-  if [ "$got_rc" = "$want_rc" ] && [ "$got_ids" = "$want_ids" ]; then
+  must_ok=yes
+  if [ -n "${must:-}" ] && ! tr -d ' \n' <<<"$out" | grep -qF "$must"; then must_ok=no; fi
+  if [ "$got_rc" = "$want_rc" ] && [ "$got_ids" = "$want_ids" ] && [ "$must_ok" = yes ]; then
     echo "ok    $name  exit=$got_rc decision=$decision [${got_ids:-none}]"
   else
-    echo "FAIL  $name  expected exit=$want_rc [${want_ids:-none}] got exit=$got_rc [${got_ids:-none}]"; rc=1
+    echo "FAIL  $name  expected exit=$want_rc [${want_ids:-none}] got exit=$got_rc [${got_ids:-none}]${must:+ must contain: $must ($must_ok)}"; rc=1
   fi
 done
 exit $rc

@@ -1,6 +1,7 @@
 # Combines the checks gate-run collected into one decision.
 # Input (built by gate-run):
-#   metadata  - key/value pairs passed with --metadata
+#   settings  - ignore_paths and terraform_dirs the run was given
+#   metadata  - key/value pairs passed with --metadata ("enforce" is moved to settings)
 #   scanned   - how many files or folders of each kind were checked
 #   checks    - [{kind, target, conftest: <conftest JSON output>}]
 #   errors    - [{kind, target, detail}]
@@ -28,6 +29,23 @@ file_name(check, result) := trim_prefix(result.filename, input.source) if check.
 
 errors := object.get(input, "errors", [])
 
+raw_metadata := object.get(input, "metadata", {})
+
+# Run settings: what was skipped, what was planned, and whether blocks fail the job.
+settings := object.union_n([
+	{"ignore_paths": [], "terraform_dirs": []},
+	object.get(input, "settings", {}),
+	{"enforce": enforce_setting},
+])
+
+default enforce_setting := null
+
+enforce_setting if raw_metadata.enforce == "true"
+
+enforce_setting := false if raw_metadata.enforce == "false"
+
+metadata := object.remove(raw_metadata, ["enforce"])
+
 default verdict := "allow"
 
 verdict := "block" if {
@@ -47,7 +65,8 @@ result := {
 	"schema": "governance.gate.decision/v1",
 	"decision": verdict,
 	"evaluated_at": time.format(time.now_ns()),
-	"metadata": object.get(input, "metadata", {}),
+	"settings": settings,
+	"metadata": metadata,
 	"scanned": input.scanned,
 	"rule_counts": rule_counts,
 	"findings": sort_findings,
@@ -71,6 +90,8 @@ counts_text := concat(", ", [$"{rule_id} x{n}" |
 	n := rule_counts[rule_id]
 ])
 
+ignored_text := concat(",", settings.ignore_paths)
+
 scanned_text := concat(" ", [$"{kind}={n}" |
 	some kind in kinds
 	n := object.get(input.scanned, kind, 0)
@@ -82,4 +103,5 @@ summary_line := concat(" ", [
 	$"findings={count(findings)} [{counts_text}]",
 	$"errors={count(errors)}",
 	$"scanned: {scanned_text}",
+	$"ignored=[{ignored_text}]",
 ])

@@ -21,6 +21,9 @@ meta_vals=()
 
 say() { printf '%s\n' "$*" >&2; }
 
+# Strip leading and trailing whitespace.
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
 # Minimal JSON string escaping: backslash, quote, newline, tab and CR are
 # escaped; any other control character is dropped.
 json_str() {
@@ -49,8 +52,8 @@ if [[ ${1:-} == summary ]]; then mode=summary; shift; fi
 while [[ $# -gt 0 ]]; do
   case $1 in
     --source)        source_dir=${2:-}; shift 2 ;;
-    --terraform-dir) tf_dirs+=("${2:-}"); shift 2 ;;
-    --ignore)        ignores+=("${2:-}"); shift 2 ;;
+    --terraform-dir) tf_dirs+=("$(trim "${2:-}")"); shift 2 ;;
+    --ignore)        ignores+=("$(trim "${2:-}")"); shift 2 ;;
     --policy)        policy=${2:-}; shift 2 ;;
     --metadata)
       kv=${2:-}
@@ -184,10 +187,22 @@ for i in "${!meta_keys[@]}"; do
   meta+=("\"${meta_keys[$i]}\":$v")
 done
 
+# What this run was told to skip and plan, so a reader can see it in the decision.
+json_list() {  # prints a JSON array of the non-empty arguments
+  local out=() v
+  for v in "$@"; do
+    v=${v%/}; [[ -z $v ]] && continue
+    out+=("$(json_str "$v")")
+  done
+  printf '[%s]' "$(join "${out[@]}")"
+}
+settings=$(printf '{"ignore_paths":%s,"terraform_dirs":%s}' \
+  "$(json_list "${ignores[@]}")" "$(json_list "${tf_dirs[@]}")")
+
 src=$(json_str "$source_dir/") || fail "source path not printable"
 input="$work/input.json"
-printf '{"source":%s,"metadata":{%s},"scanned":{"dockerfile":%d,"workflows":%d,"terraform":%d},"checks":[%s],"errors":[%s]}\n' \
-  "$src" "$(join "${meta[@]}")" "${#dockerfiles[@]}" "${#workflows[@]}" "$tf_count" \
+printf '{"source":%s,"settings":%s,"metadata":{%s},"scanned":{"dockerfile":%d,"workflows":%d,"terraform":%d},"checks":[%s],"errors":[%s]}\n' \
+  "$src" "$settings" "$(join "${meta[@]}")" "${#dockerfiles[@]}" "${#workflows[@]}" "$tf_count" \
   "$(join "${checks[@]}")" "$(join "${errors[@]}")" > "$input"
 
 ev() { opa eval --format raw --data "$policy/decision" --input "$input" "$1"; }

@@ -14,6 +14,22 @@ scanned := concat(", ", [$"{kind}: {n}" |
 	n := object.get(input.scanned, kind, 0)
 ])
 
+joined_or_none(xs) := concat(", ", xs) if count(xs) > 0
+
+joined_or_none(xs) := "none" if count(xs) == 0
+
+settings := object.get(input, "settings", {})
+
+ignored := joined_or_none(object.get(settings, "ignore_paths", []))
+
+planned := joined_or_none(object.get(settings, "terraform_dirs", []))
+
+default enforce_text := "not set"
+
+enforce_text := "on" if settings.enforce == true
+
+enforce_text := "off" if settings.enforce == false
+
 table := concat("\n", array.concat(["| Rule | Findings |", "|---|---|"], rows)) if count(rows) > 0
 
 table := "No findings." if count(rows) == 0
@@ -22,6 +38,8 @@ markdown := concat("\n", [
 	$"### Governance gate: {icon[input.decision]}",
 	"",
 	$"Checked: {scanned}. Errors: {count(input.errors)}.",
+	"",
+	$"Ignored: {ignored}. Terraform folders: {planned}. Enforce: {enforce_text}.",
 	"",
 	table,
 	"",
